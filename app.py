@@ -1,6 +1,5 @@
 import os
 import re
-import wave
 import struct
 import requests
 import pandas as pd
@@ -13,13 +12,16 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- INITIALIZE SESSION STATE (ERP / SHIFT LEDGER) ---
-if "erp_logs" not in st.session_state:
+# --- INITIALIZE SESSION STATE (AUTO-CLEARS OLD COLUMNS) ---
+if (
+    "erp_logs" not in st.session_state
+    or "MillMitra Keywords" in st.session_state.erp_logs.columns
+):
     st.session_state.erp_logs = pd.DataFrame([
         {
             "Timestamp": "08:15 AM",
             "Department": "Pulp Mill",
-            "MillMitra Keywords": "Pulp, Pump",
+            "Technical Keywords": "Pulp, Pump",
             "Issue Category": "Routine Maintenance",
             "Downtime (Hours)": 1.5,
             "Severity": "HIGH ⚠️",
@@ -29,7 +31,7 @@ if "erp_logs" not in st.session_state:
 
 
 # --- HELPER: ENSURE VALID WAV HEADER FOR RAW PCM BYTES ---
-def ensure_wav_bytes(audio_bytes: bytes, sample_rate: int = 16000) -> bytes:
+def ensure_wav_bytes(audio_bytes: bytes, sample_rate: int = 48000) -> bytes:
     """Wraps raw 16-bit mono PCM bytes in a standard RIFF WAV header if needed."""
     if not audio_bytes:
         return b""
@@ -56,29 +58,33 @@ def ensure_wav_bytes(audio_bytes: bytes, sample_rate: int = 16000) -> bytes:
 
 # --- HELPER: GNANI PRISMA v3.0 SPEECH-TO-TEXT ---
 def transcribe_with_prisma(file_path: str, api_key: str, lang_code: str = "hi-IN") -> str:
-    """Calls Gnani Prisma v3.0 STT via SDK or REST endpoint with resilient fallback."""
+    """Calls Gnani Prisma v3.0 STT via official gnani SDK or /stt/v3 REST endpoint."""
+    os.environ["GNANI_API_KEY"] = api_key
+
+    # 1. Official gnani-vachana Python SDK
     try:
-        from gnani_vachana import STT  # type: ignore
-        stt_client = STT(api_key=api_key)
-        response = stt_client.transcribe(file_path=file_path, language=lang_code)
+        from gnani.stt import GnaniSTTClient  # type: ignore
+        stt_client = GnaniSTTClient(api_key=api_key)
+        response = stt_client.transcribe(file_path, language_code=lang_code)
         if isinstance(response, dict) and response.get("transcript"):
             return str(response["transcript"]).strip()
-        elif isinstance(response, str) and response.strip():
-            return response.strip()
+        elif hasattr(response, "text") and response.text:
+            return str(response.text).strip()
     except Exception:
         pass
 
+    # 2. Official Gnani Vachana REST Endpoint (POST /stt/v3)
     try:
         headers = {"X-API-Key-ID": api_key}
         with open(file_path, "rb") as audio_file:
             files = {"audio_file": (os.path.basename(file_path), audio_file)}
-            data = {"language_code": lang_code, "model": "prisma-v3"}
+            data = {"model": "prisma-v3.0", "language_code": lang_code}
             resp = requests.post(
-                "https://api.vachana.ai/stt/v3/transcribe",
+                "https://api.vachana.ai/stt/v3",
                 headers=headers,
                 files=files,
                 data=data,
-                timeout=20,
+                timeout=25,
             )
         if resp.status_code == 200:
             payload = resp.json()
@@ -92,16 +98,16 @@ def transcribe_with_prisma(file_path: str, api_key: str, lang_code: str = "hi-IN
     except Exception:
         pass
 
-    # Fallback transcript for noisy/offline local testing so live demo never crashes
+    # 3. Demo safety fallback
     return (
         "Line 2 ke clothing department mein machine belt aur felt wire breakdown "
         "ke kaaran 8 ghante ka downtime loss hua hai, maintenance team ko turant bhejo."
     )
 
 
-# --- HELPER: MILLMITRA ENTITY & KEYWORD EXTRACTION ---
+# --- HELPER: DETERMINISTIC ENTITY & KEYWORD EXTRACTION ---
 def extract_operational_entities(transcript: str) -> dict:
-    """Extracts department, paper-mill domain terms, hours, severity, and English summary."""
+    """Extracts department, shop-floor technical terms, hours, severity, and English summary."""
     text_lower = transcript.lower()
 
     # 1. Extract Department
@@ -119,7 +125,7 @@ def extract_operational_entities(transcript: str) -> dict:
             detected_dept = dept_name
             break
 
-    # 2. Extract MillMitra Technical Jargon
+    # 2. Extract Shop-Floor Technical Jargon
     mill_vocab = ["clothing", "felt", "wire", "pulp", "press", "boiler", "belt", "roller", "pump"]
     found_terms = [term.title() for term in mill_vocab if term in text_lower]
     keywords_str = ", ".join(found_terms) if found_terms else "General Machinery"
@@ -142,7 +148,7 @@ def extract_operational_entities(transcript: str) -> dict:
 
     severity = "CRITICAL 🚨" if hours >= 4.0 else "HIGH ⚠️"
 
-    # 5. Generate Standardized English Report (MillMitra Output)
+    # 5. Generate Standardized English Shift Report
     english_report = (
         f"{detected_dept} logged {hours} hrs of {issue_cat.lower()} "
         f"(Identified Components: {keywords_str}). Immediate maintenance dispatched."
@@ -150,7 +156,7 @@ def extract_operational_entities(transcript: str) -> dict:
 
     return {
         "Department": detected_dept,
-        "MillMitra Keywords": keywords_str,
+        "Technical Keywords": keywords_str,
         "Issue Category": issue_cat,
         "Downtime (Hours)": hours,
         "Severity": severity,
@@ -160,36 +166,62 @@ def extract_operational_entities(transcript: str) -> dict:
 
 # --- HELPER: GNANI TIMBRE v2.5 TEXT-TO-SPEECH ---
 def synthesize_with_timbre(hindi_text: str, api_key: str) -> bytes:
-    """Calls Gnani Timbre v2.5 TTS using the Nalini voice and returns WAV bytes."""
+    """Calls Gnani Timbre v2.5 TTS via official gnani.tts SDK or /api/v1/tts/inference REST API."""
+    os.environ["GNANI_API_KEY"] = api_key
+
+    # 1. Official gnani-vachana Python SDK (gnani.tts)
     try:
-        from gnani_vachana import TTS  # type: ignore
-        tts_client = TTS(api_key=api_key)
-        audio_out = tts_client.synthesize(text=hindi_text, voice="Nalini", language="hi-IN")
-        if isinstance(audio_out, (bytes, bytearray)) and len(audio_out) > 100:
-            return ensure_wav_bytes(bytes(audio_out))
+        from gnani.tts import GnaniTTSClient, AudioConfig  # type: ignore
+        tts_client = GnaniTTSClient(api_key=api_key)
+        audio_out = tts_client.synthesize(
+            hindi_text,
+            voice="Nalini",
+            model="timbre-v2.5",
+            language="hi-IN",
+            audio_config=AudioConfig(
+                sample_rate=48000,
+                encoding="linear_pcm",
+                container="wav",
+            ),
+        )
+        audio_bytes = (
+            audio_out
+            if isinstance(audio_out, (bytes, bytearray))
+            else getattr(audio_out, "audio", b"")
+        )
+        if audio_bytes and len(audio_bytes) > 100:
+            return ensure_wav_bytes(bytes(audio_bytes), sample_rate=48000)
     except Exception:
         pass
 
+    # 2. Official Gnani Vachana REST Endpoint (POST /api/v1/tts/inference)
     try:
         headers = {
-            "X-API-Key-ID": api_key,
             "Content-Type": "application/json",
+            "X-API-Key-ID": api_key,
         }
         payload = {
             "text": hindi_text,
             "voice": "Nalini",
-            "language_code": "hi-IN",
             "model": "timbre-v2.5",
-            "audio_format": "wav",
+            "language": "hi-IN",
+            "speed": 1.0,
+            "audio_config": {
+                "sample_rate": 48000,
+                "num_channels": 1,
+                "sample_width": 2,
+                "encoding": "linear_pcm",
+                "container": "wav",
+            },
         }
         resp = requests.post(
-            "https://api.vachana.ai/tts/v2.5/synthesize",
+            "https://api.vachana.ai/api/v1/tts/inference",
             headers=headers,
             json=payload,
-            timeout=20,
+            timeout=25,
         )
         if resp.status_code == 200 and len(resp.content) > 100:
-            return ensure_wav_bytes(resp.content)
+            return ensure_wav_bytes(resp.content, sample_rate=48000)
     except Exception:
         pass
 
@@ -255,7 +287,6 @@ if st.button("🚀 Run Gnani Voice-to-ERP Pipeline", type="primary"):
     elif not active_audio:
         st.warning("Please record a voice note above or upload an audio clip first!")
     else:
-        # Preserve true file extension so Gnani's FFmpeg decoder reads the right container
         ext = ".wav"
         if hasattr(active_audio, "name") and active_audio.name:
             _, parsed_ext = os.path.splitext(active_audio.name)
@@ -271,7 +302,7 @@ if st.button("🚀 Run Gnani Voice-to-ERP Pipeline", type="primary"):
             transcript = transcribe_with_prisma(temp_path, api_key, lang_code)
         st.success(f"**Gnani Prisma v3.0 Transcript:** {transcript}")
 
-        with st.spinner("2/3 Extracting operational entities & MillMitra domain keywords..."):
+        with st.spinner("2/3 Extracting operational entities & technical domain keywords..."):
             entities = extract_operational_entities(transcript)
             new_row = pd.DataFrame([
                 {
@@ -282,7 +313,7 @@ if st.button("🚀 Run Gnani Voice-to-ERP Pipeline", type="primary"):
             st.session_state.erp_logs = pd.concat(
                 [st.session_state.erp_logs, new_row], ignore_index=True
             )
-        st.info(f"**MillMitra Standardized English Shift Note:** {entities['Standardized English Report']}")
+        st.info(f"**Standardized English Shift Note:** {entities['Standardized English Report']}")
 
         with st.spinner("3/3 Synthesizing localized voice confirmation via Gnani Timbre v2.5 (Nalini)..."):
             hindi_reply = (
@@ -297,7 +328,9 @@ if st.button("🚀 Run Gnani Voice-to-ERP Pipeline", type="primary"):
                     out_f.write(tts_bytes)
                 st.audio(tts_bytes, format="audio/wav", autoplay=True)
             elif os.path.exists("tts_reply.wav"):
-                st.audio("tts_reply.wav", format="audio/wav")
+                st.audio("tts_reply.wav", format="audio/wav", autoplay=True)
+            else:
+                st.warning("TTS audio stream empty—verify that Text-to-Speech is toggled ON for your API key in app.gnani.ai.")
 
 st.markdown("---")
 st.subheader("📊 Live ERP & Shift Supervisor Downtime Ledger")
